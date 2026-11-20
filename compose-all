@@ -1,0 +1,360 @@
+#!/bin/bash
+
+if [[ ${1:-} == --worker ]]; then
+    shift
+    log_dir=$1 servizio=$2 config=$3
+    shift 3
+    source "$config"
+    set -o pipefail
+    echo "==> $servizio"
+    ( cd "$COMPOSE_BASE_DIR/$servizio" && docker compose "$@" ) 2>&1 | tee "$log_dir/$servizio.log"
+    risultato=$?
+    printf '%s\n' "$risultato" > "$log_dir/$servizio.status"
+    printf '\nFinished with exit code: %s\nThe pane will remain open until the session closes.\n' "$risultato"
+    while :; do sleep 3600; done
+fi
+
+if [[ ${1:-} == --monitor ]]; then
+    shift
+    log_dir=$1 sessione=$2 automatico=$3
+    shift 3
+    servizi=("$@")
+    printf 'Waiting for the stacks to finish...\nLog: %s\n\n' "$log_dir"
+    for servizio in "${servizi[@]}"; do
+        while [[ ! -f "$log_dir/$servizio.status" ]]; do sleep 1; done
+    done
+    errore=0
+    echo 'Summary:'
+    for servizio in "${servizi[@]}"; do
+        read -r risultato < "$log_dir/$servizio.status"
+        if [[ $risultato == 0 ]]; then
+            echo "  $servizio: OK"
+        else
+            echo "  $servizio: ERROR ($risultato)"
+            errore=1
+        fi
+    done
+    printf '%s\n' "$errore" > "$log_dir/risultato"
+    echo
+    # During update, proceed automatically to the next phase only
+    # on success. Errors remain visible until Enter is pressed.
+    if [[ $automatico == true && $errore == 0 ]]; then
+        # Even a very fast phase must wait for the client to attach:
+        # otherwise it could kill the session before attach-session.
+        while [[ $(tmux display-message -p -t "=$sessione" '#{session_attached}') == 0 ]]; do
+            sleep 1
+        done
+    else
+        read -r -p 'Press Enter to close the tmux session...' || :
+    fi
+    tmux kill-session -t "=$sessione"
+    exit
+fi
+
+mostra_stack_esclusi() {
+    local output progetto directory percorso servizio configurato voce gia_vista base annotazione
+    local -a visti=()
+    if ! output=$(docker ps --filter 'label=com.docker.compose.project' --format '{{.Label "com.docker.compose.project"}}{{"\t"}}{{.Label "com.docker.compose.project.working_dir"}}'); then
+        echo 'Warning: unable to check active Compose stacks.' >&2
+        return
+    fi
+    echo
+    echo 'Active Compose stacks not included in the configuration:'
+    local trovati=false
+    while IFS=$'\t' read -r progetto directory; do
+        [[ -n $progetto ]] || continue
+        [[ -n $directory ]] || directory='(unknown directory)'
+        percorso=$directory
+        if [[ -d $directory ]]; then
+            percorso=$(cd "$directory" && pwd -P) || percorso=$directory
+        fi
+        configurato=false
+        for servizio in "${SERVIZI[@]}"; do
+            [[ -n ${COMPOSE_BASE_DIR:-} ]] || continue
+            voce=$COMPOSE_BASE_DIR/$servizio
+            if [[ -d $voce ]]; then voce=$(cd "$voce" && pwd -P) || continue; fi
+            if [[ $percorso == "$voce" ]]; then configurato=true; break; fi
+        done
+        $configurato && continue
+        gia_vista=false
+        for voce in "${visti[@]}"; do
+            if [[ $voce == "$progetto"$'\t'"$directory" ]]; then gia_vista=true; break; fi
+        done
+        $gia_vista && continue
+        visti+=("$progetto"$'\t'"$directory")
+        annotazione=''
+        base=${COMPOSE_BASE_DIR:-}
+        if [[ -n $base && -d $base ]]; then base=$(cd "$base" && pwd -P) || base=''; fi
+        if [[ -n $base && $percorso != "$base"/* ]]; then annotazione=' (outside the base directory)'; fi
+        printf '  %s: %s%s\n' "$progetto" "$directory" "$annotazione"
+        trovati=true
+    done <<< "$output"
+    $trovati || echo '  None.'
+}
+
+# Shared entry point for Compose commands used by update and normal commands.
+# In parallel, all stacks complete the phase;
+# the overall result prevents the next phase if any stack fails.
+esegui_compose() {
+    local parallel=$1
+    shift
+    local servizio log_dir sessione risultato riquadro_monitor riquadro
+    if ! $parallel; then
+        for servizio in "${ORDINATI[@]}"; do
+            echo "==> $servizio"
+            if ! (cd "$COMPOSE_BASE_DIR/$servizio" && docker compose "$@"); then
+                echo "Error on $servizio: execution stopped." >&2
+                return 1
+            fi
+        done
+        return 0
+    fi
+    command -v tmux >/dev/null || { echo 'Error: tmux is not installed.' >&2; return 1; }
+    [[ -t 0 && -t 1 ]] || { echo 'Error: parallel mode requires a terminal.' >&2; return 1; }
+    log_dir=$(mktemp -d "${TMPDIR:-/tmp}/compose-multiplo.XXXXXX") || return 1
+    sessione="compose-multiplo-$$"
+    export COMPOSE_BASE_DIR
+    riquadro_monitor=$(tmux new-session -d -P -F '#{pane_id}' -s "$sessione" bash "$script" --monitor "$log_dir" "$sessione" "$chiusura_automatica" "${ORDINATI[@]}") || return 1
+    # Borders and titles apply only to this window. The IDs returned by tmux
+    # identify the panes even if the selected pane changes.
+    tmux set-option -w -t "$riquadro_monitor" pane-border-status top
+    tmux set-option -w -t "$riquadro_monitor" pane-border-format ' #{pane_title} '
+    tmux select-pane -t "$riquadro_monitor" -T 'Monitor'
+    for servizio in "${ORDINATI[@]}"; do
+        if ! riquadro=$(tmux split-window -P -F '#{pane_id}' -t "=$sessione":0 bash "$script" --worker "$log_dir" "$servizio" "$config" "$@"); then
+            echo "Error creating the pane for $servizio." >&2
+            tmux kill-session -t "=$sessione"
+            return 1
+        fi
+        tmux select-pane -t "$riquadro" -T "$servizio"
+        tmux select-layout -t "=$sessione":0 tiled >/dev/null
+    done
+    tmux select-pane -t "$riquadro_monitor"
+    echo "Logs saved in: $log_dir"
+    tmux attach-session -t "=$sessione"
+    if [[ -f $log_dir/risultato ]]; then
+        read -r risultato < "$log_dir/risultato"
+        return "$risultato"
+    fi
+    printf 'tmux session left before completion.\nTo resume: tmux attach-session -t =%s\n' "$sessione" >&2
+    return 1
+}
+
+# Include stopped containers: docker ps alone would hide errors.
+container_stack() {
+    (cd "$COMPOSE_BASE_DIR/$1" && docker compose ps --all --quiet)
+}
+
+verifica_container() {
+    local riferimento=$1
+    local servizio ids id dati nome stato codice riavvii salute iniziali
+    for servizio in "${ORDINATI[@]}"; do
+        ids=$(container_stack "$servizio") || return 1
+        if [[ -z $ids ]]; then
+            echo "Error: no containers found for $servizio." >&2
+            return 1
+        fi
+        for id in $ids; do
+            dati=$(docker inspect --format '{{.Name}} {{.State.Status}} {{.State.ExitCode}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id") || return 1
+            read -r nome stato codice riavvii salute <<< "$dati"
+            iniziali=$(awk -v id="$id" '$1 == id { print $2; exit }' "$riferimento") || return 1
+            # A recreated container has a new ID: its counter starts at zero.
+            iniziali=${iniziali:-0}
+            if (( riavvii > iniziali )); then
+                echo "Error: $servizio $nome has restarted again." >&2
+                return 1
+            fi
+            case $stato in
+                running)
+                    if [[ $salute != none && $salute != healthy ]]; then
+                        echo "Error: $servizio $nome has health status $salute." >&2
+                        return 1
+                    fi
+                    ;;
+                exited)
+                    # Allow temporary tasks that completed successfully,
+                    # such as migrations or initialization tasks defined by the stack.
+                    if (( codice != 0 )); then
+                        echo "Error: $servizio $nome exited with code $codice." >&2
+                        return 1
+                    fi
+                    echo "  $servizio $nome: completed successfully (exit 0)."
+                    ;;
+                *)
+                    echo "Error: $servizio $nome is in state $stato (exit $codice)." >&2
+                    return 1
+                    ;;
+            esac
+        done
+    done
+}
+
+# The subshell limits traps to this phase. On exit, including error or Ctrl-C,
+# stop only the log clients and tail; containers are not stopped.
+osserva_container() (
+    local riferimento=$1 log_update=$2 da=$3
+    local servizio i pid inizio rimanenti pausa
+    local -a pid_logs=() file_logs=()
+    local pid_tail=''
+
+    ferma_visualizzazione() {
+        for pid in "${pid_logs[@]}"; do
+            kill "$pid" 2>/dev/null || :
+        done
+        if [[ -n $pid_tail ]]; then
+            kill "$pid_tail" 2>/dev/null || :
+        fi
+        # Reap terminated processes without leaving clients in the background.
+        for pid in "${pid_logs[@]}"; do
+            wait "$pid" 2>/dev/null || :
+        done
+        if [[ -n $pid_tail ]]; then
+            wait "$pid_tail" 2>/dev/null || :
+        fi
+    }
+    trap ferma_visualizzazione EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    for i in "${!ORDINATI[@]}"; do
+        servizio=${ORDINATI[i]}
+        file_logs[i]="$log_update/stack-$i-${servizio//\//_}.log"
+        : > "${file_logs[i]}" || return 1
+        (
+            cd "$COMPOSE_BASE_DIR/$servizio" || exit 1
+            # exec allows the Docker client to be stopped directly.
+            # Keep Compose prefixes to identify individual containers.
+            exec docker compose logs --follow --no-color --timestamps --since "$da"
+        ) > "${file_logs[i]}" 2>&1 &
+        pid_logs[i]=$!
+    done
+
+    # tail distinguishes stacks using their file headers.
+    # Logs remain available after display ends.
+    tail -n +1 -f "${file_logs[@]}" &
+    pid_tail=$!
+    echo "==> Watching containers for at least $COMPOSE_UPDATE_WATCH_SECONDS seconds"
+    inizio=$SECONDS
+    while :; do
+        # A log reading error also prevents cleanup.
+        # A follower may exit successfully for one-shot stacks.
+        for pid in "${pid_logs[@]}"; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                if ! wait "$pid"; then
+                    echo 'Error reading Compose logs.' >&2
+                    return 1
+                fi
+            fi
+        done
+        if ! kill -0 "$pid_tail" 2>/dev/null; then
+            echo 'Error: log display interrupted.' >&2
+            return 1
+        fi
+        verifica_container "$riferimento" 2>&1 | tee -a "$log_update/verifica.log" || return 1
+        rimanenti=$((COMPOSE_UPDATE_WATCH_SECONDS - (SECONDS - inizio)))
+        (( rimanenti <= 0 )) && break
+        pausa=5
+        # Avoid rounding the configured duration up to a multiple of 5.
+        (( rimanenti < pausa )) && pausa=$rimanenti
+        sleep "$pausa" || return 1
+    done
+)
+
+aggiorna_stack() {
+    local servizio ids id log_update riferimento da
+    # The default also applies to existing configuration files.
+    COMPOSE_UPDATE_WATCH_SECONDS=${COMPOSE_UPDATE_WATCH_SECONDS-10}
+    if [[ ! $COMPOSE_UPDATE_WATCH_SECONDS =~ ^[1-9][0-9]*$ ]]; then
+        echo 'Error: COMPOSE_UPDATE_WATCH_SECONDS must be a positive integer.' >&2
+        return 1
+    fi
+    # Check prerequisites before downloading or modifying stacks.
+    command -v tmux >/dev/null || { echo 'Error: tmux is not installed.' >&2; return 1; }
+    [[ -t 0 && -t 1 ]] || { echo 'Error: update requires a terminal.' >&2; return 1; }
+    for servizio in "${ORDINATI[@]}"; do
+        (cd "$COMPOSE_BASE_DIR/$servizio" && docker compose config --quiet) || return 1
+    done
+    log_update=$(mktemp -d "${TMPDIR:-/tmp}/compose-update.XXXXXX") || return 1
+    echo "Update logs: $log_update"
+    riferimento=$log_update/riavvii-prima.txt
+    : > "$riferimento" || return 1
+
+    # Preserve previous counters: old restarts must not block the update,
+    # while new restarts are detected even after recovery.
+    for servizio in "${ORDINATI[@]}"; do
+        ids=$(container_stack "$servizio") || return 1
+        for id in $ids; do
+            docker inspect --format '{{.Id}} {{.RestartCount}}' "$id" >> "$riferimento" || return 1
+        done
+    done
+
+    chiusura_automatica=true
+    echo '==> Parallel pull'
+    esegui_compose true pull || return 1
+    echo '==> Parallel build'
+    esegui_compose true build --pull || return 1
+    # Include stack startup in the logs, not just the watch phase.
+    da=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || return 1
+    echo '==> Starting in order'
+    # pipefail preserves Compose errors while tee saves the log.
+    esegui_compose false up -d --wait 2>&1 | tee "$log_update/up.log" || return 1
+
+    osserva_container "$riferimento" "$log_update" "$da" || return 1
+
+    # Node-wide cleanup is allowed only if all phases succeed.
+    echo '==> docker system prune -af'
+    docker system prune -af 2>&1 | tee "$log_update/prune.log" || return 1
+    echo 'Update completed.'
+}
+
+config=$HOME/.docker-tools/compose-all.conf
+if [[ ! -r $config ]]; then
+    if [[ ! -e $config ]]; then
+        printf 'Error: configuration missing: %s\nCreate the file from the sample and customize it:\n  cp %q %q\n' "$config" "$HOME/.docker-tools/compose-all.conf.sample" "$config" >&2
+    else
+        echo "Error: configuration is not readable: $config" >&2
+    fi
+    exit 1
+fi
+source "$config"
+if [[ -z ${COMPOSE_BASE_DIR:-} || ${#SERVIZI[@]} -eq 0 ]]; then
+    printf 'Error: configure COMPOSE_BASE_DIR and at least one stack in %s\nSample configuration: %s\n' "$config" "$HOME/.docker-tools/compose-all.conf.sample" >&2
+    mostra_stack_esclusi
+    exit 1
+fi
+reverse=false parallel=false
+while [[ ${1:-} == -r || ${1:-} == -p ]]; do
+    case $1 in -r) reverse=true ;; -p) parallel=true ;; esac
+    shift
+done
+if (($# == 0)); then
+    echo "Usage: $0 [-r] [-p] command [arguments...] or $0 update" >&2
+    exit 1
+fi
+ORDINATI=()
+if $reverse; then
+    for ((i=${#SERVIZI[@]}-1; i>=0; i--)); do ORDINATI+=("${SERVIZI[i]}"); done
+else
+    ORDINATI=("${SERVIZI[@]}")
+fi
+# update has its own order: parallel pull/build, sequential startup.
+# Reject ambiguous options rather than silently ignoring them.
+script=$(cd "$(dirname "$0")" && pwd)/$(basename "$0") || exit 1
+chiusura_automatica=false
+set -o pipefail
+if [[ $1 == update ]]; then
+    if (($# != 1)) || $reverse || $parallel; then
+        echo "Usage: $0 update (without -r, -p or other arguments)" >&2
+        exit 1
+    fi
+    aggiorna_stack
+    risultato=$?
+    if (( risultato != 0 )); then
+        echo 'Update interrupted. No automatic rollback; subsequent phases were not run.' >&2
+    fi
+else
+    esegui_compose "$parallel" "$@"
+    risultato=$?
+fi
+mostra_stack_esclusi
+exit "$risultato"

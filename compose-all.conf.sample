@@ -1,0 +1,9 @@
+# Copy to ~/.docker-tools/compose-all.conf and customize.
+COMPOSE_BASE_DIR=/root/docker
+SERVIZI=(
+    # example
+)
+
+# Observation time after up --wait, in seconds (positive integer).
+# If omitted, compose-all update uses 10 seconds.
+COMPOSE_UPDATE_WATCH_SECONDS=10
